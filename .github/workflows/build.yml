@@ -1,4 +1,4 @@
-name: Build Ace5 Kernel KSU+SUSFS
+name: Build Ace5 Kernel OEM
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: kernel_src
+          ref: 'android14-6.1'   # 使用 android14-6.1 分支，兼容你的 6.1.141 内核
 
       - name: 安装编译依赖
         run: |
@@ -21,24 +22,24 @@ jobs:
       - name: 下载 Clang
         run: |
           mkdir -p ~/clang
-          wget -q https://github.com/ZyCromerZ/Clang/releases/download/19.0.0-20240318/Clang-19.0.0-20240318.tar.gz
-          tar -xf Clang-*.tar.gz -C ~/clang
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+          if [ $? -ne 0 ]; then
+            wget -q https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/1.0.0/Clang-19.0.0-20240318.tar.gz -O clang.tar.gz
+          fi
+          tar -xf clang.tar.gz -C ~/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
       - name: 写入功能配置
         working-directory: kernel_src
         run: |
-          # 查找实际存在的 defconfig
-          if [ -f arch/arm64/configs/vendor/kalama_gki_defconfig ]; then
+          # 骁龙 8 Gen 3 的 OEM defconfig 一般是 vendor/kalama-perf_defconfig
+          DEFCONFIG="arch/arm64/configs/vendor/kalama-perf_defconfig"
+          if [ ! -f "${DEFCONFIG}" ]; then
+            # 如果不存在，尝试 GKI 的 defconfig 作为后备
             DEFCONFIG="arch/arm64/configs/vendor/kalama_gki_defconfig"
-          elif [ -f arch/arm64/configs/gki_defconfig ]; then
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
-          else
-            echo "❌ 找不到 defconfig"
-            exit 1
           fi
           echo "使用 defconfig: ${DEFCONFIG}"
-          
+
           cat >> "${DEFCONFIG}" << 'EOF'
           CONFIG_LOCALVERSION="-TvT"
           CONFIG_MODULES=y
@@ -78,18 +79,19 @@ jobs:
           export CC=clang
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
-          
-          if [ -f arch/arm64/configs/vendor/kalama_gki_defconfig ]; then
-            DEFCONFIG="arch/arm64/configs/vendor/kalama_gki_defconfig"
+
+          # 选择 defconfig
+          if [ -f arch/arm64/configs/vendor/kalama-perf_defconfig ]; then
+            DEFCONFIG="vendor/kalama-perf_defconfig"
           else
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+            DEFCONFIG="vendor/kalama_gki_defconfig"
           fi
-          
+
           make O=out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             ${DEFCONFIG}
-            
+
           make O=out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \

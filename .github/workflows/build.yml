@@ -1,308 +1,111 @@
-name: Kernel Build Process
-permissions:
-  contents: write
-  actions: write
+name: Build Ace5 Kernel KSU+SUSFS
 
 on:
-  workflow_call:
-    inputs:
-      version:
-        required: true
-        type: string
-      android_version:
-        required: true
-        type: string
-      kernel_version:
-        required: true
-        type: string
-      sublevel:
-        required: true
-        type: string
-      os_patch_level:
-        required: true
-        type: string
-      variant:
-        required: false
-        type: string
-      feature_set:
-        required: true
-        type: string
-      use_repo:
-        required: false
-        type: boolean
+  workflow_dispatch:
 
 jobs:
-  build-gki:
-    name: "${{ inputs.kernel_version }}.${{ inputs.sublevel }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }} (${{ inputs.variant }})"
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v5
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          path: kernel_src
 
-    - name: Free Disk Space
-      if: false
-      uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
-      with:
-        remove_android: true
-        remove_dotnet: true
-        remove_haskell: true
-        remove_tool_cache: true
-        #remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-        #remove_packages_one_command: true
-        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-        rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
-        rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
-        testing: false
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu make python3 zip curl git ccache
 
-    - name: Setup more Swap (for LTO)
-      uses: thejerrybao/setup-swap-space@v1   # or pierotofy/set-swap-space
-      with:
-        swap-size-gb: 10          # 10-24 GB is common for heavy LTO
-        # swap-space-path: /mnt/swapfile   # optional
+      - name: 下载 Clang
+        run: |
+          mkdir -p ~/clang
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/19.0.0-20240318/Clang-19.0.0-20240318.tar.gz
+          tar -xf Clang-*.tar.gz -C ~/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
 
-    - name: Setup Build Environment
-      uses: ./.github/actions/setup-build-environment
-      env:
-        BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
+      - name: 写入功能配置
+        working-directory: kernel_src
+        run: |
+          # 查找实际存在的 defconfig
+          if [ -f arch/arm64/configs/vendor/kalama_gki_defconfig ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/kalama_gki_defconfig"
+          elif [ -f arch/arm64/configs/gki_defconfig ]; then
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          else
+            echo "❌ 找不到 defconfig"
+            exit 1
+          fi
+          echo "使用 defconfig: ${DEFCONFIG}"
           
-    - name: Download Kernel Repository
-      uses: ./.github/actions/download-kernel
-      with:
-        version: ${{ inputs.version }}
-        android_version: ${{ inputs.android_version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        os_patch_level: ${{ inputs.os_patch_level }}
-        use_repo: ${{ inputs.use_repo }}
+          cat >> "${DEFCONFIG}" << 'EOF'
+          CONFIG_LOCALVERSION="-TvT"
+          CONFIG_MODULES=y
+          CONFIG_MODULE_UNLOAD=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_HAVE_DYNAMIC_FTRACE=y
+          CONFIG_HAVE_FENTRY=y
+          CONFIG_DYNAMIC_FTRACE=y
+          CONFIG_BPF_JIT=y
+          CONFIG_BPF_SYSCALL=y
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_DEFAULT_BBR=y
+          CONFIG_IP_SET=m
+          CONFIG_IP_SET_HASH_IP=m
+          CONFIG_IP_SET_HASH_IPPORT=m
+          CONFIG_IP_SET_HASH_NET=m
+          CONFIG_IP_SET_HASH_NETPORT=m
+          CONFIG_IP_SET_BITMAP_IP=m
+          CONFIG_IP_SET_BITMAP_PORT=m
+          CONFIG_IP_SET_LIST_SET=m
+          CONFIG_IP_NF_MATCH_SET=m
+          CONFIG_NETFILTER_XT_SET=m
+          EOF
 
-    - name: Extract Sublevel and Set File Name
-      id: extract
-      uses: ./.github/actions/extract-sublevel-file-name
-      with:
-        android_version: ${{ inputs.android_version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        sublevel: ${{ inputs.sublevel }}
-        os_patch_level: ${{ inputs.os_patch_level }}
-        variant: ${{ inputs.variant }}
+          sed -i '/CONFIG_KSU_SUSFS/d' "${DEFCONFIG}" 2>/dev/null || true
+          cat >> "${DEFCONFIG}" << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_ENABLE_AUTO_ADD=y
+          EOF
 
-    - name: Kernel Fixes
-      uses: ./.github/actions/kernel-fixes
-      with:
-        version: ${{ inputs.version }}
-        android_version: ${{ inputs.android_version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        sublevel: ${{ steps.extract.outputs.sublevel }}
-        os_patch_level: ${{ inputs.os_patch_level }}
-
-    - name: Setup KernelSU-Next
-      if: contains(inputs.feature_set, 'KSUN') || inputs.feature_set == 'FULL'
-      uses: ./.github/actions/kernelsu
-
-    - name: SUSFS
-      if: contains(inputs.feature_set, 'SUSFS') || inputs.feature_set == 'FULL'
-      uses: ./.github/actions/susfs
-      with:
-        version: ${{ inputs.version }}
-        android_version: ${{ inputs.android_version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        os_patch_level: ${{ inputs.os_patch_level }}
-        sublevel: ${{ steps.extract.outputs.sublevel }}
-
-    - name: Baseband Guard
-      if: (contains(inputs.feature_set, 'BBG') || inputs.feature_set == 'FULL')
-      uses: ./.github/actions/bbg
-
-    - name: Setup Networking
-      if: contains(inputs.feature_set, 'NET') || inputs.feature_set == 'FULL'
-      uses: ./.github/actions/networking
-      with:
-        kernel_version: ${{ inputs.kernel_version }}
-        android_version: ${{ inputs.android_version }}
-
-    - name: DroidSpaces-OSS Patches
-      if: contains(inputs.feature_set, 'DS') || inputs.feature_set == 'FULL'
-      uses: ./.github/actions/droidspaces
-      with:
-        version: ${{ inputs.version }}
-        kernel_version: ${{ inputs.kernel_version }}
-
-    - name: Setup Misc Configs
-      uses: ./.github/actions/misc
-      with:
-        version: ${{ inputs.version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        android_version: ${{ inputs.android_version }}
-        sublevel: ${{ steps.extract.outputs.sublevel }}
-        variant: ${{ inputs.variant }}
-
-    - name: Apply Module Check Bypass
-      if: ${{ inputs.variant == 'Bypass' }}
-      uses: ./.github/actions/module-check-bypass
-      with:
-        kernel_version: ${{ inputs.kernel_version }}
-
-    - name: Apply Device-Specific Patches
-      uses: ./.github/actions/apply-device-patches
-      with:
-        version: ${{ inputs.version }}
-        kernel_version: ${{ inputs.kernel_version }}
-
-    - name: Apply ABI Compare Bypass
-      if: false
-      working-directory: ${{ github.workspace }}/kernel
-      run: |
-        # ABI compare bypass per kernel/android version
-        # Edit each block as needed per version
-        if [[ "$ANDROID_VERSION" == "android12" && "$KERNEL_VERSION" == "5.10" ]]; then
-          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/abi/compare_to_symbol_list
-        elif [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.10" ]]; then
-          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/kernel/abi/compare_to_symbol_list
-        elif [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
-          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/kernel/abi/compare_to_symbol_list
-        elif [[ "$ANDROID_VERSION" == "android14" && "$KERNEL_VERSION" == "5.15" ]]; then
-          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
-        elif [[ "$ANDROID_VERSION" == "android14" && "$KERNEL_VERSION" == "6.1" ]]; then
-          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
-        elif [[ "$ANDROID_VERSION" == "android15" && "$KERNEL_VERSION" == "6.6" ]]; then
-          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
-        fi
-
-    - name: Apply Kernel Branding
-      uses: ./.github/actions/apply-kernel-branding
-      with:
-        variant: ${{ inputs.variant }}
-        kernel_version: ${{ inputs.kernel_version }}
-        android_version: ${{ inputs.android_version }}
-        sublevel: ${{ steps.extract.outputs.sublevel }}
-
-    - name: Remove Protected Exports
-      uses: ./.github/actions/remove-protected-exports
-
-    - name: Clean Kernel Flags
-      uses: ./.github/actions/clean-kernel-flags
-
-    - name: Scan and collect patch rejects
-      id: scan
-      if: ${{ always() && inputs.variant == 'Normal' }}
-      uses: ./.github/actions/scan-patch-rejects
-        
-    - name: Upload Rejects
-      if: ${{ always() && inputs.variant == 'Normal' }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: ${{ steps.extract.outputs.file_name }}-Rejects
-        path: patch-rejects/
-        if-no-files-found: ignore
-        compression-level: 9
-
-    - name: 'Setup Cache and Build Environment'
-      uses: ./.github/actions/cache-setup
-      with:
-        version: ${{ inputs.version }}
-        android_version: ${{ inputs.android_version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        sublevel: ${{ steps.extract.outputs.sublevel }}
-
-    - name: Restore build caches (ccache, bazel, bazel-disk, lto)
-      id: restore-caches
-      uses: ./.github/actions/cache-restore
-      with:
-        cache_paths: |
-          /home/runner/.ccache
-          /home/runner/.cache/bazel
-          /home/runner/.ld_cache
-        cache_keys: |
-          buildcache-${{ inputs.kernel_version }}
-          buildcache-${{ inputs.kernel_version }}
-          buildcache-${{ inputs.kernel_version }}
-        cache_buckets: |
-          ccache-cache
-          bazel-cache
-          lto-cache
-        compression_level: 9
-        restore_keys: |
-          buildcache-
-
-    - name: Check cache hit
-      run: |
-        if [ "${{ steps.restore-caches.outputs.cache-hit }}" = "true" ]; then
-          echo "✅ Cache HIT"
-          IFS=',' read -ra KEYS <<< "${{ steps.restore-caches.outputs.cache-key }}"
-          IFS=',' read -ra SIZES <<< "${{ steps.restore-caches.outputs.cache-size }}"
+      - name: 编译内核
+        working-directory: kernel_src
+        run: |
+          export ARCH=arm64
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
           
-          for i in "${!KEYS[@]}"; do
-            echo "   [${i}] ${KEYS[$i]} (${SIZES[$i]})"
-          done
-        else
-          echo "❌ No caches found - Fresh build"
-        fi
+          if [ -f arch/arm64/configs/vendor/kalama_gki_defconfig ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/kalama_gki_defconfig"
+          else
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          fi
+          
+          make O=out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            ${DEFCONFIG}
+            
+          make O=out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j$(nproc --all)
 
-    - name: Get Cache Stats
-      uses: ./.github/actions/cache-stats
-      with:
-        clear_stats: true
+      - name: 打包 AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cp kernel_src/out/arch/arm64/boot/Image ak3/ 2>/dev/null || \
+          cp kernel_src/out/arch/arm64/boot/Image.gz ak3/
+          cp kernel_src/out/arch/arm64/boot/dtb.img ak3/ 2>/dev/null || true
+          cp kernel_src/out/arch/arm64/boot/dtbo.img ak3/ 2>/dev/null || true
+          cd ak3 && zip -r9 ../Ace5-Kernel-$(date +%Y%m%d-%H%M).zip *
 
-    - name: Build Kernel
-      env:
-        SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
-        KBUILD_BUILD_TIMESTAMP: ${{ env.KBUILD_BUILD_TIMESTAMP }}
-      uses: ./.github/actions/build-kernel
-
-    - name: Get Cache Stats
-      uses: ./.github/actions/cache-stats
-      with:
-        clear_stats: false
-
-    - name: Save build caches (ccache, bazel, bazel-disk, lto)
-      uses: ./.github/actions/cache-save
-      with:
-        cache_paths: |
-          /home/runner/.ccache
-          /home/runner/.cache/bazel
-          /home/runner/.ld_cache
-        cache_keys: |
-          buildcache-${{ inputs.kernel_version }}
-          buildcache-${{ inputs.kernel_version }}
-          buildcache-${{ inputs.kernel_version }}
-        cache_buckets: |
-          ccache-cache
-          bazel-cache
-          lto-cache
-        compression_level: 9
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Create Bootimgs Folder and Build Boot Images
-      uses: ./.github/actions/build-boot-images
-
-    - name: Upload Boot Image (boot.img)
-      uses: actions/upload-artifact@v7
-      with:
-        path: ${{ github.workspace }}/boot-artifacts/${{ steps.extract.outputs.file_name }}-boot.img
-        if-no-files-found: error
-        archive: false
-
-    - name: Upload Boot Image (boot-gz.img)
-      uses: actions/upload-artifact@v7
-      with:
-        path: ${{ github.workspace }}/boot-artifacts/${{ steps.extract.outputs.file_name }}-boot-gz.img
-        if-no-files-found: error
-        archive: false
-
-    - name: Upload Boot Image (boot-lz4.img)
-      uses: actions/upload-artifact@v7
-      with:
-        path: ${{ github.workspace }}/boot-artifacts/${{ steps.extract.outputs.file_name }}-boot-lz4.img
-        if-no-files-found: error
-        archive: false
-
-    - name: Prepare AnyKernel3 Zip
-      uses: ./.github/actions/prepare-anykernel3
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v7
-      with:
-        name: ${{ steps.extract.outputs.file_name }}-AnyKernel3
-        path: ${{ github.workspace }}/AnyKernel3/**
-        if-no-files-found: ignore
-        compression-level: 9
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5-Kernel
+          path: Ace5-Kernel-*.zip
